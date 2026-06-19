@@ -1,0 +1,26 @@
+services:
+  whalescope-bot:
+    build: .
+    container_name: whalescope-bot
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Polling 默认关闭；在 .env 或此处覆盖以启用
+      ARKHAM_POLLING_ENABLED: ${ARKHAM_POLLING_ENABLED:-false}
+      ARKHAM_TRANSFERS_URL: ${ARKHAM_TRANSFERS_URL:-}
+      ARKHAM_POLL_INTERVAL_SECONDS: ${ARKHAM_POLL_INTERVAL_SECONDS:-30}
+      ARKHAM_STORAGE_STATE_PATH: /data/arkham-storage-state.json
+      ARKHAM_HEADLESS: ${ARKHAM_HEADLESS:-true}
+    volumes:
+      # Arkham 登录态文件放到宿主机 ./data/ 下，便于你手动维护
+      - ./data:/data
+    shm_size: "1gb"
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
