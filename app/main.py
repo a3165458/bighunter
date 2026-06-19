@@ -9,6 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 
 from app.config import settings
 from app.alerts import process_payload, parse_usd_value
+from app import binance_listings
 
 # ---- 日志 ----
 logging.basicConfig(
@@ -29,12 +30,20 @@ async def lifespan(_app: FastAPI):
     _http_client = httpx.AsyncClient(timeout=15.0)
     logger.info(
         "WhaleScope Bot started | min_usd_value=%s | exclude_tokens=%s | "
-        "webhook_secret=%s | polling=%s",
+        "webhook_secret=%s | polling=%s | binance_filter=%s",
         f"{settings.min_usd_value:,.0f}",
         len(settings.exclude_tokens),
         "enabled" if settings.webhook_secret else "disabled",
         "enabled" if settings.arkham_polling_enabled else "disabled",
+        "enabled" if settings.require_binance_listing else "disabled",
     )
+
+    # 启动币安上币列表缓存刷新
+    if settings.require_binance_listing:
+        await binance_listings.start_refresh_task(
+            _http_client,
+            interval=settings.binance_refresh_interval,
+        )
 
     # 启动 Arkham 轮询（若已配置）
     if settings.arkham_polling_enabled:
@@ -47,6 +56,9 @@ async def lifespan(_app: FastAPI):
     # 关闭轮询
     if _poller is not None:
         await _poller.stop()
+
+    # 关闭币安缓存刷新
+    await binance_listings.stop_refresh_task()
 
     await _http_client.aclose()
     logger.info("WhaleScope Bot stopped")
@@ -67,6 +79,18 @@ async def health():
         "status": "ok",
         "service": "whalescope",
         "polling": "enabled" if settings.arkham_polling_enabled else "disabled",
+        "binance_filter": "enabled" if settings.require_binance_listing else "disabled",
+    }
+
+
+# ---- 币安上币缓存状态 ----
+@app.get("/binance-status")
+async def binance_status():
+    info = binance_listings.get_cache_info()
+    return {
+        "status": "ok",
+        "filter_enabled": settings.require_binance_listing,
+        **info,
     }
 
 

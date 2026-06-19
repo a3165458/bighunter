@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     # Webhook 鉴权（可选）
     webhook_secret: str = ""
 
+    # ---- 币安上币过滤 ----
+    # 仅播报已在币安（现货或合约）上架的代币
+    require_binance_listing: bool = True
+    # 币安上币列表缓存刷新间隔（秒），默认 1 小时
+    binance_refresh_interval: int = 3600
+
     # 日志
     log_level: str = "INFO"
 

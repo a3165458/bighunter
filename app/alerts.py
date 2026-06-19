@@ -10,6 +10,7 @@ import httpx
 
 from app.config import settings
 from app.formatter import format_alert
+from app import binance_listings
 
 logger = logging.getLogger("whalescope.alerts")
 
@@ -38,6 +39,8 @@ def should_alert(token: str, usd_value: float) -> tuple[bool, str]:
         return False, "mainstream_token"
     if usd_value < settings.min_usd_value:
         return False, "below_threshold"
+    if settings.require_binance_listing and not binance_listings.is_listed(token):
+        return False, "not_on_binance"
     return True, ""
 
 

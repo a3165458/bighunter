@@ -2,6 +2,8 @@
 
 import re
 
+from app import binance_listings
+
 # ---- MarkdownV2 特殊字符转义 ----
 _MD2_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
 
@@ -50,6 +52,21 @@ def _direction_emoji(from_label: str, to_label: str) -> tuple[str, str]:
     if from_is_cex and to_is_cex:
         return "🔄 CEX 互转", "交易所间调仓"
     return "🐋 巨鲸转账", "链上大额移动，关注后续动作"
+
+
+def _binance_badge(token: str) -> str:
+    """生成币安上架状态标签。"""
+    detail = binance_listings.listing_detail(token)
+    badges = []
+    if detail["spot"]:
+        badges.append("现货")
+    if detail["usdt_m"]:
+        badges.append("U本位")
+    if detail["coin_m"]:
+        badges.append("币本位")
+    if not badges:
+        return ""
+    return _esc(" | ".join(badges))
 
 
 def _build_links(token: str, blockchain: str, arkham_url: str) -> str:
@@ -102,6 +119,7 @@ def format_alert(payload: dict) -> str:
     unit_amount = payload.get("unitAmount", 0)
 
     direction, hint = _direction_emoji(from_label, to_label)
+    badge = _binance_badge(token)
 
     lines = [
         f"🔔 *WhaleScope 冷门币异动*",
@@ -112,6 +130,12 @@ def format_alert(payload: dict) -> str:
         f"💵 价值: *{_fmt_usd(usd_value)}*",
         f"📦 数量: {_fmt_amount(unit_amount, token)}",
         f"⛓ 链: {_esc(blockchain.capitalize())}",
+    ]
+
+    if badge:
+        lines.append(f"🏦 币安: {badge}")
+
+    lines.extend([
         "",
         f"📤 From: `{_esc(from_label)}` \\({_short_addr(from_addr)}\\)",
         f"📥 To:   `{_esc(to_label)}` \\({_short_addr(to_addr)}\\)",
@@ -119,5 +143,5 @@ def format_alert(payload: dict) -> str:
         f"💡 _{_esc(hint)}_",
         "",
         f"🔗 {_build_links(token, blockchain, arkham_url)}",
-    ]
+    ])
     return "\n".join(lines)
