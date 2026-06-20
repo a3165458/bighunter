@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # Telegram
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    telegram_topic_id: int = 0
 
     # 过滤阈值
     min_usd_value: float = 50_000.0

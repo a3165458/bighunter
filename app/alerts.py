@@ -63,15 +63,19 @@ async def send_telegram_message(
         return {"ok": False, "error": "Telegram not configured (missing token or chat_id)"}
 
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-    try:
-        resp = await http_client.post(
-            url,
-            json={
+    payload = {
                 "chat_id": settings.telegram_chat_id,
                 "text": text,
                 "parse_mode": "MarkdownV2",
                 "disable_web_page_preview": True,
-            },
+            }
+    if settings.telegram_topic_id:
+        payload["message_thread_id"] = settings.telegram_topic_id
+
+    try:
+        resp = await http_client.post(
+            url,
+            json=payload,
         )
     except httpx.RequestError as exc:
         logger.error("Telegram request error: %s", exc)
