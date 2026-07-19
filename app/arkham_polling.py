@@ -392,6 +392,10 @@ class ArkhamPoller:
         self._running = False
         # 首轮只登记页面上已有的记录、不推送，避免每次重启把旧转账重播一遍
         self._primed = False
+        # CDP 模式：缓存上次成功提取数据的页面。arkm.com 加载 /transfers 后
+        # URL 会归一到 /（首页即实时转账流），按 URL 匹配每轮都会失配并
+        # 触发整页导航，徒增 Cloudflare 挑战风险
+        self._cdp_page = None
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -562,7 +566,12 @@ class ArkhamPoller:
             await self._init_browser()
 
         try:
-            page = self._find_cdp_page()
+            page = None
+            if self._cdp_page is not None and not self._cdp_page.is_closed():
+                page = self._cdp_page
+            else:
+                self._cdp_page = None
+                page = self._find_cdp_page()
             if page is None:
                 # transfers 标签页丢了（被重定向/手动关闭）：
                 # 复用现有标签页导航回去，而不是永久卡死等人工干预
@@ -627,10 +636,13 @@ class ArkhamPoller:
                 page, allow_text_fallback=settings.arkham_text_fallback
             )
             logger.info("Extracted %d transfer(s) from CDP page", len(transfers))
+            if transfers:
+                self._cdp_page = page
             await self._dispatch(transfers)
         except Exception as exc:
             logger.error("CDP polling error: %s", exc, exc_info=True)
             # 连接可能断开，下次重连
+            self._cdp_page = None
             await self._cleanup_browser()
 
     async def _poll_once(self) -> None:

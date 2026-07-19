@@ -133,7 +133,9 @@ async def webhook(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Payload must be a JSON object")
 
-    logger.debug("Received webhook payload: %s", payload)
+    # INFO 级记录原始 payload：Arkham 实际字段格式若与预期不符，
+    # 处理管线会静默跳过，必须能从日志还原现场
+    logger.info("Received webhook payload: %s", payload)
 
     # 提前校验 usdValue 格式，webhook 路径对格式错误返回 400
     if parse_usd_value(payload.get("usdValue", 0)) is None:
