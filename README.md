@@ -107,8 +107,45 @@ docker-compose logs -f whalescope-bot
 
 ```text
 WhaleScope Bot started | ... | polling=enabled
-Starting Arkham polling | url=... | interval=30s | headless=True
+Starting Arkham polling | url=... | interval=30s | mode=launch(headless=True)
 ```
+
+### 4. CDP 模式（推荐：挂接已通过验证的 Chrome）
+
+arkm.com 由 Cloudflare 保护，数据中心 IP 上自建的无头浏览器通常会被交互式人机验证拦住。
+CDP 模式改为**挂接一个已在运行的真实 Chrome**：人先在浏览器里手动过一次验证，
+Bot 之后只驱动这个浏览器定时刷新、提取数据。
+
+服务器上的参考搭建（Xvfb 虚拟屏 + 真 Chrome + noVNC 远程操作）：
+
+```bash
+# 1. 虚拟显示器 + Chrome（调试端口 9222，profile 持久化到 ./data）
+Xvfb :99 -screen 0 1440x900x24 &
+DISPLAY=:99 google-chrome --no-sandbox --user-data-dir=./data/chrome-profile \
+  --remote-debugging-port=9222 --window-size=1440,860 https://arkm.com/transfers &
+
+# 2. noVNC 远程桌面（浏览器访问 http://服务器IP:6080/vnc.html 手动过验证）
+x11vnc -display :99 -rfbport 5901 -listen 127.0.0.1 -forever -shared -quiet &
+websockify --web /usr/share/novnc 0.0.0.0:6080 127.0.0.1:5901 &
+
+# 3. 把 9222 转发给容器网段（Chrome 调试端口只监听 127.0.0.1）
+socat TCP-LISTEN:9223,fork,reuseaddr TCP:127.0.0.1:9222 &
+```
+
+然后在 `.env` 配置：
+
+```env
+ARKHAM_POLLING_ENABLED=true
+ARKHAM_TRANSFERS_URL=https://arkm.com/transfers
+ARKHAM_CDP_URL=http://172.17.0.1:9223   # docker 网桥网关地址，按实际网段调整
+```
+
+CDP 模式的行为：
+
+- 每轮轮询先检查页面是否停在 Cloudflare 验证页——**是则暂停轮询并打日志提醒**，
+  等你在 noVNC 里手动点完验证后自动恢复（暂停期间不会刷新页面打断你的操作）
+- 正常页面每轮 `reload` 拿最新数据（clearance cookie 有效期内刷新不会重新触发验证）
+- transfers 标签页被重定向或误关时，会自动导航回去
 
 ## 本地开发
 
@@ -213,10 +250,12 @@ curl -X POST http://localhost:8000/webhook \
 如果 webhook 正常、但页面轮询没抓到数据，优先检查：
 
 1. `ARKHAM_TRANSFERS_URL` 是否真的是你筛选后的最终页面 URL
-2. `./data/arkham-storage-state.json` 是否存在
-3. 日志里是否出现 `All extraction strategies failed`
+2. 日志里是否出现 `Cloudflare challenge ... polling is paused`——需要打开
+   `http://服务器IP:6080/vnc.html` 手动完成人机验证，之后轮询自动恢复
+3. 日志里是否出现 `DOM extraction strategies found no transfers`（页面结构变化
+   或未渲染完成；`ARKHAM_TEXT_FALLBACK=true` 可开启全页文本兜底，但可能误报）
 4. 你的筛选结果是否本身就是主流币，或低于 `MIN_USD_VALUE`
-5. Arkham 页面是否改版导致 DOM 结构变化
+5. 非 CDP 模式下：`./data/arkham-storage-state.json` 登录态文件是否存在
 
 > 注：轮询模式重启后的**第一轮**只登记页面上已有的记录、不推送（防止旧转账重播），从第二轮开始播报新增记录。
 

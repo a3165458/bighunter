@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     arkham_storage_state_path: str = "/data/arkham-storage-state.json"
     # Playwright 是否无头模式
     arkham_headless: bool = True
+    # CDP 模式：挂接一个已在运行的 Chrome（如 http://172.17.0.1:9223）。
+    # 设置后不再自建浏览器，直接操作已打开的 transfers 页——复用其中的
+    # Cloudflare clearance cookie / 登录态，每轮轮询时刷新该页拿最新数据。
+    arkham_cdp_url: str = ""
+    # 是否允许"全页文本正则"兜底提取（Strategy 4）。页面半渲染时该策略
+    # 会把价格/市值等无关文本误判成转账，生产环境默认关闭。
+    arkham_text_fallback: bool = False
 
     # ---- 主流代币黑名单（硬编码，大写匹配） ----
     exclude_tokens: set[str] = {

@@ -202,14 +202,18 @@ async def _parse_row_element(row, cell_selector: str) -> Optional[dict]:
         return None
 
 
-async def _extract_transfers_from_page(page) -> list[dict]:
+async def _extract_transfers_from_page(
+    page, allow_text_fallback: bool = False
+) -> list[dict]:
     """
     多策略从 Arkham 页面提取转账记录。
 
     Strategy 1 — <table tbody tr> + <td>
     Strategy 2 — role="row" + role="cell"/"gridcell"
     Strategy 3 — data-testid 含 transfer/transaction/row
-    Strategy 4 — 全页面文本正则兜底
+    Strategy 4 — 全页面文本正则兜底（仅 allow_text_fallback=True 时启用；
+                 页面渲染未完成时会把价格/市值等无关文本切成假转账，
+                 生产轮询默认关闭以防误报）
     """
     transfers: list[dict] = []
 
@@ -267,6 +271,12 @@ async def _extract_transfers_from_page(page) -> list[dict]:
         logger.debug("S3 failed: %s", exc)
 
     # --- Strategy 4: 全页文本正则兜底 ---
+    if not allow_text_fallback:
+        logger.warning(
+            "DOM extraction strategies found no transfers — skipping this cycle "
+            "(text fallback disabled, set ARKHAM_TEXT_FALLBACK=true to enable)"
+        )
+        return []
     try:
         logger.debug("S4: fallback full-page text parsing")
         content = await page.content()
@@ -398,10 +408,11 @@ class ArkhamPoller:
             return
 
         logger.info(
-            "Starting Arkham polling | url=%s | interval=%ds | headless=%s",
+            "Starting Arkham polling | url=%s | interval=%ds | mode=%s",
             settings.arkham_transfers_url,
             settings.arkham_poll_interval_seconds,
-            settings.arkham_headless,
+            f"cdp({settings.arkham_cdp_url})" if settings.arkham_cdp_url
+            else f"launch(headless={settings.arkham_headless})",
         )
         self._running = True
         self._task = asyncio.create_task(self._poll_loop(), name="arkham-poller")
@@ -424,6 +435,18 @@ class ArkhamPoller:
     async def _init_browser(self) -> None:
         """初始化 Playwright Chromium 实例，支持 storage_state 登录态。"""
         from playwright.async_api import async_playwright  # 延迟导入，避免启动时报错
+
+        if settings.arkham_cdp_url:
+            # CDP 模式：挂接外部已登录的 Chrome，不自建浏览器
+            logger.info("Connecting to existing Chrome via CDP: %s", settings.arkham_cdp_url)
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.connect_over_cdp(
+                settings.arkham_cdp_url
+            )
+            if not self._browser.contexts:
+                raise RuntimeError("CDP browser has no contexts")
+            self._context = self._browser.contexts[0]
+            return
 
         logger.info("Initializing Playwright browser")
         self._pw = await async_playwright().start()
@@ -452,7 +475,24 @@ class ArkhamPoller:
         self._context = await self._browser.new_context(**ctx_kwargs)
 
     async def _cleanup_browser(self) -> None:
-        """关闭浏览器资源，容忍错误。"""
+        """关闭浏览器资源，容忍错误。CDP 模式下只断开连接，不动外部 Chrome 的页面。"""
+        if settings.arkham_cdp_url:
+            for obj, name in [(self._browser, "cdp connection")]:
+                if obj is not None:
+                    try:
+                        await obj.close()
+                    except Exception as exc:
+                        logger.warning("Error closing %s: %s", name, exc)
+            if self._pw is not None:
+                try:
+                    await self._pw.stop()
+                except Exception:
+                    pass
+            self._context = None
+            self._browser = None
+            self._pw = None
+            return
+
         for obj, name in [
             (self._context, "context"),
             (self._browser, "browser"),
@@ -471,8 +511,134 @@ class ArkhamPoller:
     # 轮询逻辑
     # ------------------------------------------------------------------
 
+    def _find_cdp_page(self):
+        """在外部 Chrome 已打开的标签页中定位 transfers 页面。"""
+        target = settings.arkham_transfers_url.split("://", 1)[-1].rstrip("/")
+        for page in self._context.pages:
+            if target and target in page.url:
+                return page
+        return None
+
+    async def _dispatch(self, transfers: list[dict]) -> None:
+        """去重后经共享管线过滤并发送。首轮只预热去重集，不推送。"""
+        if not self._primed:
+            if not transfers:
+                # 空结果不算预热完成，否则下一轮会把存量记录全当新增推送
+                return
+            for transfer in transfers:
+                _is_new_transfer(transfer)
+            self._primed = True
+            logger.info(
+                "First polling cycle: primed dedup with %d existing transfer(s), "
+                "no alerts sent", len(transfers),
+            )
+            return
+
+        sent_count = 0
+        for transfer in transfers:
+            if not _is_new_transfer(transfer):
+                continue
+            result = await process_payload(
+                transfer, self._http_client, source="polling"
+            )
+            if result.get("status") == "sent":
+                sent_count += 1
+
+        if sent_count:
+            logger.info("Polling cycle: sent %d new alert(s)", sent_count)
+
+    @staticmethod
+    async def _is_challenged(page) -> bool:
+        """判断页面当前是否停在 Cloudflare 人机验证页。"""
+        try:
+            title = (await page.title()).lower()
+        except Exception:
+            return False
+        return "moment" in title or "attention" in title or "verification" in title
+
+    async def _poll_once_cdp(self) -> None:
+        """CDP 模式单次轮询：驱动外部 Chrome 中已打开的页面刷新并提取。"""
+        if self._context is None:
+            await self._init_browser()
+
+        try:
+            page = self._find_cdp_page()
+            if page is None:
+                # transfers 标签页丢了（被重定向/手动关闭）：
+                # 复用现有标签页导航回去，而不是永久卡死等人工干预
+                if not self._context.pages:
+                    logger.warning("CDP mode: browser has no open tabs")
+                    return
+                page = self._context.pages[0]
+                if await self._is_challenged(page):
+                    logger.warning(
+                        "CDP mode: tab is on a Cloudflare challenge — complete "
+                        "the verification manually via VNC, polling is paused"
+                    )
+                    return
+                logger.info(
+                    "CDP mode: transfers tab lost, re-navigating %s",
+                    settings.arkham_transfers_url,
+                )
+                try:
+                    await page.goto(
+                        settings.arkham_transfers_url,
+                        wait_until="domcontentloaded",
+                        timeout=45_000,
+                    )
+                except Exception as exc:
+                    logger.warning("CDP mode: re-navigation failed: %s", exc)
+                    return
+            else:
+                # 挑战页上绝不 reload——否则 VNC 里的人工验证会被反复打断。
+                # 只有正常页面才刷新（后台标签页被节流，DOM 不会自己更新；
+                # clearance cookie 有效期内刷新不会重新触发验证）
+                if await self._is_challenged(page):
+                    logger.warning(
+                        "CDP mode: transfers tab is on a Cloudflare challenge — "
+                        "complete the verification manually via VNC, polling is paused"
+                    )
+                    return
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=45_000)
+                except Exception as exc:
+                    logger.warning(
+                        "CDP mode: page reload failed (%s), parsing current DOM", exc
+                    )
+
+            # 等数据表格真正渲染出多行，避免解析半渲染页面
+            try:
+                await page.wait_for_function(
+                    "document.querySelectorAll("
+                    "\"table tbody tr, [role='row']\").length >= 3",
+                    timeout=25_000,
+                )
+            except Exception:
+                pass
+
+            if await self._is_challenged(page):
+                logger.warning(
+                    "CDP mode: Cloudflare challenge appeared after reload — "
+                    "complete the verification manually via VNC, polling is paused"
+                )
+                return
+
+            transfers = await _extract_transfers_from_page(
+                page, allow_text_fallback=settings.arkham_text_fallback
+            )
+            logger.info("Extracted %d transfer(s) from CDP page", len(transfers))
+            await self._dispatch(transfers)
+        except Exception as exc:
+            logger.error("CDP polling error: %s", exc, exc_info=True)
+            # 连接可能断开，下次重连
+            await self._cleanup_browser()
+
     async def _poll_once(self) -> None:
         """单次轮询：加载页面 → 提取 → 过滤发送。"""
+        if settings.arkham_cdp_url:
+            await self._poll_once_cdp()
+            return
+
         if self._context is None:
             await self._init_browser()
 
@@ -494,31 +660,11 @@ class ArkhamPoller:
             except Exception:
                 logger.warning("Expected selectors not found within timeout, proceeding anyway")
 
-            transfers = await _extract_transfers_from_page(page)
+            transfers = await _extract_transfers_from_page(
+                page, allow_text_fallback=settings.arkham_text_fallback
+            )
             logger.info("Extracted %d transfer(s) from page", len(transfers))
-
-            if not self._primed:
-                for transfer in transfers:
-                    _is_new_transfer(transfer)
-                self._primed = True
-                logger.info(
-                    "First polling cycle: primed dedup with %d existing transfer(s), "
-                    "no alerts sent", len(transfers),
-                )
-                return
-
-            sent_count = 0
-            for transfer in transfers:
-                if not _is_new_transfer(transfer):
-                    continue
-                result = await process_payload(
-                    transfer, self._http_client, source="polling"
-                )
-                if result.get("status") == "sent":
-                    sent_count += 1
-
-            if sent_count:
-                logger.info("Polling cycle: sent %d new alert(s)", sent_count)
+            await self._dispatch(transfers)
 
         except Exception as exc:
             logger.error("Polling error during page fetch/parse: %s", exc, exc_info=True)
