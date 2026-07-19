@@ -50,8 +50,10 @@ RUN mkdir -p /data
 EXPOSE 8000
 
 # gunicorn + uvicorn workers，生产就绪
+# 单 worker：币安列表刷新 / Arkham 轮询 / 内存去重都是进程内状态，
+# 多 worker 会导致后台任务重复执行、告警重复推送
 CMD ["gunicorn", "app.main:app", \
      "-k", "uvicorn.workers.UvicornWorker", \
      "-b", "0.0.0.0:8000", \
-     "-w", "2", \
+     "-w", "1", \
      "--access-logfile", "-"]

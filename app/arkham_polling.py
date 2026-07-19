@@ -380,6 +380,8 @@ class ArkhamPoller:
         self._context = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        # 首轮只登记页面上已有的记录、不推送，避免每次重启把旧转账重播一遍
+        self._primed = False
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -494,6 +496,16 @@ class ArkhamPoller:
 
             transfers = await _extract_transfers_from_page(page)
             logger.info("Extracted %d transfer(s) from page", len(transfers))
+
+            if not self._primed:
+                for transfer in transfers:
+                    _is_new_transfer(transfer)
+                self._primed = True
+                logger.info(
+                    "First polling cycle: primed dedup with %d existing transfer(s), "
+                    "no alerts sent", len(transfers),
+                )
+                return
 
             sent_count = 0
             for transfer in transfers:

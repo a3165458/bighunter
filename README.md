@@ -110,7 +110,7 @@ WhaleScope Bot started | ... | polling=enabled
 Starting Arkham polling | url=... | interval=30s | headless=True
 ```
 
-### 3. 本地开发
+## 本地开发
 
 ```bash
 pip install -r requirements.txt
@@ -124,8 +124,29 @@ uvicorn app.main:app --reload --port 8000
 3. 在 Alert 的 Webhook 选项中填入你的公网地址：
 
 ```
-https://你的域名或IP:8000/webhook
+http://你的域名或IP:8000/webhook
 ```
+
+如果设置了 `WEBHOOK_SECRET`，鉴权支持两种方式（任选其一）：
+
+- 请求 Header：`Arkham-Webhook-Token: <你的密钥>`
+- URL 查询参数（适合无法自定义 Header 的平台）：
+
+```
+http://你的域名或IP:8000/webhook?token=<你的密钥>
+```
+
+> **注意防火墙**：确认服务器防火墙（ufw / 云安全组）放行了 8000 端口，否则 Arkham 的请求根本到不了服务器。
+
+## 验证 Telegram 推送链路
+
+部署完成后可先发一条测试消息，确认 Bot Token / Chat ID / Topic 配置无误：
+
+```bash
+curl -X POST http://localhost:8000/test-telegram
+```
+
+预期返回 `{"status": "sent", "telegram_message_id": ...}`，同时群里会收到一条测试消息。
 
 ## 本地测试（ngrok / cpolar）
 
@@ -177,7 +198,17 @@ curl -X POST http://localhost:8000/webhook \
 {"status": "sent", "token": "PEPE", "usd_value": 125000, "telegram_message_id": 123}
 ```
 
-## 页面轮询排障
+## 排障清单
+
+完全收不到告警时，按顺序检查：
+
+1. **容器是否在运行**：`docker ps` 里 `whalescope-bot` 是否为 `Up` 状态（`docker-compose up -d` 启动）
+2. **Telegram 链路**：`curl -X POST http://localhost:8000/test-telegram` 群里是否收到测试消息
+3. **防火墙**：`ufw status` 是否放行 8000 端口（webhook 模式必须）
+4. **Arkham 侧**：Alert 是否创建且启用、Webhook URL 是否填对（含 `?token=` 密钥）
+5. **过滤条件**：目标代币是否被 `MIN_USD_VALUE` / 主流币黑名单 / 币安上币过滤（`REQUIRE_BINANCE_LISTING`）拦下——日志里会打印 `Skipped ... : <原因>`
+
+### 页面轮询专项
 
 如果 webhook 正常、但页面轮询没抓到数据，优先检查：
 
@@ -186,6 +217,8 @@ curl -X POST http://localhost:8000/webhook \
 3. 日志里是否出现 `All extraction strategies failed`
 4. 你的筛选结果是否本身就是主流币，或低于 `MIN_USD_VALUE`
 5. Arkham 页面是否改版导致 DOM 结构变化
+
+> 注：轮询模式重启后的**第一轮**只登记页面上已有的记录、不推送（防止旧转账重播），从第二轮开始播报新增记录。
 
 ## 项目结构
 

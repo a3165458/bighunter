@@ -16,8 +16,16 @@ def _esc(text: str) -> str:
 def _short_addr(addr: str) -> str:
     """地址脱敏：0x1234...abcd"""
     if addr and len(addr) > 12:
-        return f"{addr[:6]}\\.\\.\\.\\.{addr[-4:]}"
+        return f"{addr[:6]}\\.\\.\\.{addr[-4:]}"
     return _esc(addr or "Unknown")
+
+
+def _to_float(value: object) -> float:
+    """宽容地转 float：webhook/页面解析出的数值可能是字符串。"""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _fmt_usd(value: float) -> str:
@@ -108,15 +116,15 @@ def _build_links(token: str, blockchain: str, arkham_url: str) -> str:
 
 def format_alert(payload: dict) -> str:
     """将 Arkham Webhook payload 格式化为 MarkdownV2 消息。"""
-    token = payload.get("tokenSymbol", "UNKNOWN")
-    usd_value = payload.get("usdValue", 0)
-    from_label = payload.get("fromAddressLabel", "Unknown")
-    to_label = payload.get("toAddressLabel", "Unknown")
-    from_addr = payload.get("fromAddress", "")
-    to_addr = payload.get("toAddress", "")
-    blockchain = payload.get("blockchain", "ethereum")
-    arkham_url = payload.get("arkhamUrl", "")
-    unit_amount = payload.get("unitAmount", 0)
+    token = payload.get("tokenSymbol") or "UNKNOWN"
+    usd_value = _to_float(payload.get("usdValue", 0))
+    from_label = payload.get("fromAddressLabel") or "Unknown"
+    to_label = payload.get("toAddressLabel") or "Unknown"
+    from_addr = payload.get("fromAddress") or ""
+    to_addr = payload.get("toAddress") or ""
+    blockchain = payload.get("blockchain") or "ethereum"
+    arkham_url = payload.get("arkhamUrl") or ""
+    unit_amount = _to_float(payload.get("unitAmount", 0))
 
     direction, hint = _direction_emoji(from_label, to_label)
     badge = _binance_badge(token)

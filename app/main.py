@@ -94,14 +94,35 @@ async def binance_status():
     }
 
 
+# ---- Telegram 连通性自测 ----
+@app.post("/test-telegram")
+async def test_telegram():
+    """发送一条测试消息到已配置的 Telegram 群组，验证 token/chat_id/topic 配置。"""
+    from app.alerts import send_telegram_message
+
+    if _http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+
+    result = await send_telegram_message(
+        "✅ *WhaleScope 测试消息*\n\nBot 推送链路正常，等待转账告警中。", _http_client
+    )
+    if not result["ok"]:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return {"status": "sent", "telegram_message_id": result["message_id"]}
+
+
 # ---- Webhook 入口 ----
 @app.post("/webhook")
 async def webhook(
     request: Request,
     arkham_webhook_token: str | None = Header(None, alias="Arkham-Webhook-Token"),
+    token: str | None = None,
 ):
-    # 可选鉴权
-    if settings.webhook_secret and arkham_webhook_token != settings.webhook_secret:
+    # 可选鉴权：支持 Header（Arkham-Webhook-Token）或 URL 查询参数 ?token=
+    # （部分平台配置 webhook 时无法自定义 Header，可将密钥拼在 URL 里）
+    if settings.webhook_secret and settings.webhook_secret not in (
+        arkham_webhook_token, token
+    ):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
     try:
