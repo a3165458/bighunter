@@ -3,6 +3,8 @@
 import re
 
 from app import binance_listings
+from app import token_guard
+from app.config import settings
 
 # ---- MarkdownV2 特殊字符转义 ----
 _MD2_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
@@ -129,8 +131,9 @@ def format_alert(payload: dict) -> str:
     direction, hint = _direction_emoji(from_label, to_label)
     badge = _binance_badge(token)
 
+    title = "🔥 *WhaleScope 妖币异动*" if settings.yaobi_mode else "🔔 *WhaleScope 冷门币异动*"
     lines = [
-        f"🔔 *WhaleScope 冷门币异动*",
+        title,
         "",
         f"*{direction}*",
         "",
@@ -142,6 +145,10 @@ def format_alert(payload: dict) -> str:
 
     if badge:
         lines.append(f"🏦 币安: {badge}")
+
+    heat = token_guard.describe_heat(token)
+    if heat:
+        lines.append(f"📊 {_esc(heat)}")
 
     lines.extend([
         "",

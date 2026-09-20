@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart Arkham Chrome when CDP/poller heartbeat is stale
+After=arkham-chrome.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/bighunter/scripts/arkham_cdp_watchdog.sh
+Nice=10

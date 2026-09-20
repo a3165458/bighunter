@@ -11,6 +11,7 @@ import httpx
 from app.config import settings
 from app.formatter import format_alert
 from app import binance_listings
+from app import token_guard
 
 logger = logging.getLogger("whalescope.alerts")
 
@@ -35,12 +36,15 @@ def should_alert(token: str, usd_value: float) -> tuple[bool, str]:
         (True, "")           — 应发送
         (False, skip_reason) — 应跳过，附带跳过原因
     """
-    if token in settings.exclude_tokens:
+    if settings.filter_mainstream_tokens and token in settings.exclude_tokens:
         return False, "mainstream_token"
     if usd_value < settings.min_usd_value:
         return False, "below_threshold"
     if settings.require_binance_listing and not binance_listings.is_listed(token):
         return False, "not_on_binance"
+    ok, skip_reason = token_guard.evaluate(token, usd_value)
+    if not ok:
+        return False, skip_reason
     return True, ""
 
 
@@ -51,6 +55,8 @@ def should_alert(token: str, usd_value: float) -> tuple[bool, str]:
 async def send_telegram_message(
     text: str,
     http_client: httpx.AsyncClient,
+    reply_markup: Optional[dict] = None,
+    parse_mode: str = "MarkdownV2",
 ) -> dict:
     """
     发送 Telegram 消息，返回结果 dict，不抛出异常。
@@ -66,9 +72,12 @@ async def send_telegram_message(
     payload = {
                 "chat_id": settings.telegram_chat_id,
                 "text": text,
-                "parse_mode": "MarkdownV2",
                 "disable_web_page_preview": True,
             }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     if settings.telegram_topic_id:
         payload["message_thread_id"] = settings.telegram_topic_id
 
@@ -130,7 +139,8 @@ async def process_payload(
         return {"status": "skipped", "reason": skip_reason}
 
     message = format_alert(payload)
-    tg_result = await send_telegram_message(message, http_client)
+    markup = token_guard.mute_keyboard(token) if settings.telegram_mute_button else None
+    tg_result = await send_telegram_message(message, http_client, reply_markup=markup)
 
     if not tg_result["ok"]:
         logger.error(
@@ -139,6 +149,7 @@ async def process_payload(
         )
         return {"status": "error", "reason": tg_result["error"]}
 
+    token_guard.record_alert(token)
     logger.info("[%s] Alert sent: %s $%.0f", source, token, usd_value)
     return {
         "status": "sent",

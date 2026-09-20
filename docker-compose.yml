@@ -2,24 +2,49 @@ services:
   whalescope-bot:
     build: .
     container_name: whalescope-bot
-    ports:
-      - "8000:8000"
+    # host 网络：容器直接共享宿主网络栈，
+    # 使 ARKHAM_CDP_URL=http://127.0.0.1:9222 能挂接宿主上已过 Cloudflare 的 Chrome
+    network_mode: host
+    command: ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker", "-b", "127.0.0.1:8000", "-w", "1", "--access-logfile", "-"]
     env_file:
       - .env
     environment:
-      # Polling 默认关闭；在 .env 或此处覆盖以启用
-      ARKHAM_POLLING_ENABLED: ${ARKHAM_POLLING_ENABLED:-false}
-      ARKHAM_TRANSFERS_URL: ${ARKHAM_TRANSFERS_URL:-}
+      # 可选 REST Key（没有就留空 → 走无 Key 公开页/CDP 路径）
+      ARKHAM_API_KEY: ${ARKHAM_API_KEY:-}
+      ARKHAM_API_BASE_URL: ${ARKHAM_API_BASE_URL:-https://api.arkm.com}
+      ARKHAM_API_BASES: ${ARKHAM_API_BASES:-}
+      ARKHAM_API_USD_GTE: ${ARKHAM_API_USD_GTE:-0}
+      ARKHAM_API_LIMIT: ${ARKHAM_API_LIMIT:-50}
+      ARKHAM_API_POLL_INTERVAL_SECONDS: ${ARKHAM_API_POLL_INTERVAL_SECONDS:-60}
+      # 无 Key 主路径：公开页轮询 + CDP 过 Cloudflare
+      ARKHAM_POLLING_ENABLED: ${ARKHAM_POLLING_ENABLED:-true}
+      ARKHAM_TRANSFERS_URL: ${ARKHAM_TRANSFERS_URL:-https://arkm.com/transfers}
       ARKHAM_POLL_INTERVAL_SECONDS: ${ARKHAM_POLL_INTERVAL_SECONDS:-30}
       ARKHAM_STORAGE_STATE_PATH: /data/arkham-storage-state.json
+      ARKHAM_ANONYMOUS_MODE: ${ARKHAM_ANONYMOUS_MODE:-true}
       ARKHAM_HEADLESS: ${ARKHAM_HEADLESS:-true}
+      ARKHAM_CDP_URL: ${ARKHAM_CDP_URL:-http://127.0.0.1:9222}
+      ARKHAM_CF_WAIT_SECONDS: ${ARKHAM_CF_WAIT_SECONDS:-120}
+      ARKHAM_CDP_RELOAD: ${ARKHAM_CDP_RELOAD:-false}
+      ARKHAM_TEXT_FALLBACK: ${ARKHAM_TEXT_FALLBACK:-false}
+      # 住宅代理（云服务器直连 arkm 常被 CF 拦；CDP 挂接已通过验证的浏览器时无需）
+      ARKHAM_PROXY_SERVER: ${ARKHAM_PROXY_SERVER:-}
+      BLOCKED_TOKENS: ${BLOCKED_TOKENS:-}
+      TOKEN_GUARD_PATH: ${TOKEN_GUARD_PATH:-/data/token_guard.json}
+      TOKEN_COOLDOWN_SECONDS: ${TOKEN_COOLDOWN_SECONDS:-3600}
+      TOKEN_COOLDOWN_BREAK_USD: ${TOKEN_COOLDOWN_BREAK_USD:-0}
+      YAOBI_MODE: ${YAOBI_MODE:-true}
+      TOKEN_MAX_ALERTS_PER_WINDOW: ${TOKEN_MAX_ALERTS_PER_WINDOW:-2}
+      TOKEN_ALERT_WINDOW_SECONDS: ${TOKEN_ALERT_WINDOW_SECONDS:-21600}
+      TELEGRAM_MUTE_BUTTON: ${TELEGRAM_MUTE_BUTTON:-true}
+      TELEGRAM_ADMIN_USER_IDS: ${TELEGRAM_ADMIN_USER_IDS:-}
     volumes:
-      # Arkham 登录态文件放到宿主机 ./data/ 下，便于你手动维护
+      # Arkham storage state（CF clearance cookie 等）持久化到宿主机 ./data/
       - ./data:/data
     shm_size: "1gb"
     restart: always
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -10,6 +11,8 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from app.config import settings
 from app.alerts import process_payload, parse_usd_value
 from app import binance_listings
+from app import token_guard
+from app import poller_health
 
 # ---- 日志 ----
 logging.basicConfig(
@@ -17,25 +20,38 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(message)s",
 )
 logger = logging.getLogger("whalescope")
+# httpx 的 INFO 请求日志包含完整 URL；Telegram Bot token 位于 URL 路径中。
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---- 全局资源（由 lifespan 管理） ----
 _http_client: httpx.AsyncClient | None = None
-_poller = None  # ArkhamPoller instance，仅当 polling 启用时创建
+_pollers: list = []  # 各数据源 poller 实例
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _http_client, _poller
+    global _http_client, _pollers
 
     _http_client = httpx.AsyncClient(timeout=15.0)
+    # 唯一数据源：Arkham。有 API Key → REST；无 Key → 公开页浏览器/CDP（匿名）。
+    # 两种模式取其一，避免同一笔转账被双源重复推送。
+    sources = []
+    if settings.arkham_api_key:
+        sources.append("arkham_api")
+    elif settings.arkham_polling_enabled:
+        sources.append("arkham_browser")
     logger.info(
         "WhaleScope Bot started | min_usd_value=%s | exclude_tokens=%s | "
-        "webhook_secret=%s | polling=%s | binance_filter=%s",
+        "webhook_secret=%s | sources=%s | binance_filter=%s | yaobi=%s | "
+        "cooldown=%ss | blocked=%s",
         f"{settings.min_usd_value:,.0f}",
         len(settings.exclude_tokens),
         "enabled" if settings.webhook_secret else "disabled",
-        "enabled" if settings.arkham_polling_enabled else "disabled",
+        sources or ["webhook-only"],
         "enabled" if settings.require_binance_listing else "disabled",
+        "on" if settings.yaobi_mode else "off",
+        settings.token_cooldown_seconds,
+        token_guard.snapshot()["blocked_count"],
     )
 
     # 启动币安上币列表缓存刷新
@@ -45,17 +61,44 @@ async def lifespan(_app: FastAPI):
             interval=settings.binance_refresh_interval,
         )
 
-    # 启动 Arkham 轮询（若已配置）
-    if settings.arkham_polling_enabled:
-        from app.arkham_polling import ArkhamPoller
-        _poller = ArkhamPoller(_http_client)
-        await _poller.start()
+    # 1) Arkham 官方 REST（有 Key）：无需浏览器，最稳
+    if settings.arkham_api_key:
+        from app.arkham_api_polling import ArkhamApiPoller
+        p = ArkhamApiPoller(_http_client)
+        await p.start()
+        _pollers.append(p)
+        if settings.arkham_polling_enabled:
+            logger.info("ARKHAM_API_KEY 已配置：优先 REST，跳过网页轮询（避免双源重复推送）")
+
+    # 2) Arkham 公开页（无 Key / 无账户登录）：首页 RECENT TRANSFERS + CDP 过 CF
+    elif settings.arkham_polling_enabled:
+        try:
+            from app.arkham_home_polling import ArkhamHomePoller
+            p = ArkhamHomePoller(_http_client)
+            await p.start()
+            _pollers.append(p)
+        except Exception as exc:
+            logger.warning("Arkham home poller failed to start (%s), fallback page poller", exc)
+            from app.arkham_polling import ArkhamPoller
+            p = ArkhamPoller(_http_client)
+            await p.start()
+            _pollers.append(p)
+
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        from app.telegram_commands import TelegramCommandPoller
+        commands = TelegramCommandPoller(_http_client)
+        await commands.start()
+        _pollers.append(commands)
 
     yield
 
     # 关闭轮询
-    if _poller is not None:
-        await _poller.stop()
+    for p in _pollers:
+        try:
+            await p.stop()
+        except Exception as exc:
+            logger.warning("Error stopping poller: %s", exc)
+    _pollers = []
 
     # 关闭币安缓存刷新
     await binance_listings.stop_refresh_task()
@@ -75,11 +118,20 @@ app = FastAPI(
 # ---- 健康检查 ----
 @app.get("/health")
 async def health():
+    sources = []
+    if settings.arkham_api_key:
+        sources.append("arkham_api")
+    elif settings.arkham_polling_enabled:
+        sources.append("arkham_browser")
+    poller = poller_health.snapshot()
     return {
-        "status": "ok",
+        "status": "ok" if (not sources or poller["ok"] or poller["age_seconds"] is None) else "degraded",
         "service": "whalescope",
-        "polling": "enabled" if settings.arkham_polling_enabled else "disabled",
+        "polling_sources": sources,
+        "polling": "enabled" if sources else "disabled",
         "binance_filter": "enabled" if settings.require_binance_listing else "disabled",
+        "token_guard": token_guard.snapshot(),
+        "poller": poller,
     }
 
 
@@ -92,6 +144,52 @@ async def binance_status():
         "filter_enabled": settings.require_binance_listing,
         **info,
     }
+
+
+# ---- 代币屏蔽 ----
+@app.get("/blocklist")
+async def get_blocklist():
+    return {"status": "ok", **token_guard.snapshot(), "items": token_guard.list_blocked()}
+
+
+@app.post("/mute")
+async def mute_token(request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+    token = token_guard.normalize_token((body or {}).get("token") if isinstance(body, dict) else "")
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+    until = 0.0
+    seconds = 0
+    if isinstance(body, dict) and body.get("seconds"):
+        try:
+            seconds = int(body["seconds"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="seconds must be an integer") from exc
+        if seconds > 0:
+            until = time.time() + seconds
+    token_guard.block_token(
+        token,
+        reason="api",
+        source="http",
+        until=until,
+    )
+    return {"status": "blocked", "token": token, "until": until, "seconds": seconds}
+
+
+@app.post("/unmute")
+async def unmute_token(request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+    token = token_guard.normalize_token((body or {}).get("token") if isinstance(body, dict) else "")
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+    existed = token_guard.unblock_token(token)
+    return {"status": "unblocked" if existed else "not_found", "token": token}
 
 
 # ---- Telegram 连通性自测 ----
@@ -152,4 +250,3 @@ async def webhook(
         raise HTTPException(status_code=502, detail=result["reason"])
 
     return result
-

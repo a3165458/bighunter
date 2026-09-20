@@ -54,6 +54,6 @@ EXPOSE 8000
 # 多 worker 会导致后台任务重复执行、告警重复推送
 CMD ["gunicorn", "app.main:app", \
      "-k", "uvicorn.workers.UvicornWorker", \
-     "-b", "0.0.0.0:8000", \
+     "-b", "127.0.0.1:8000", \
      "-w", "1", \
      "--access-logfile", "-"]
